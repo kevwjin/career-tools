@@ -49,6 +49,7 @@ enum Command {
     Ingest(IngestArgs),
     Process(ProcessArgs),
     Daily(DailyArgs),
+    Weekly(WeeklyArgs),
     Inspect {
         #[command(subcommand)]
         command: InspectCommand,
@@ -79,6 +80,18 @@ struct GmailAuthArgs {
 struct DailyArgs {
     #[arg(long, default_value_t = 26)]
     hours: u64,
+
+    #[arg(long, default_value_t = 100)]
+    limit: i64,
+}
+
+#[derive(Args)]
+struct WeeklyArgs {
+    #[arg(long, default_value_t = 192)]
+    hours: u64,
+
+    #[arg(long, default_value_t = 500)]
+    limit: i64,
 }
 
 #[derive(Args)]
@@ -309,7 +322,22 @@ async fn main() -> Result<()> {
                     dry_run: false,
                     vllm_base_url: "http://127.0.0.1:8000/v1".to_string(),
                     model: "Qwen/Qwen3-8B-AWQ".to_string(),
-                    limit: 100,
+                    limit: args.limit,
+                    force: false,
+                },
+            )
+            .await
+        }
+        Command::Weekly(args) => {
+            let pool = connect_and_migrate(&cli.database_url).await?;
+            ingest(&pool, &cfg, args.hours).await?;
+            process(
+                &pool,
+                ProcessArgs {
+                    dry_run: false,
+                    vllm_base_url: "http://127.0.0.1:8000/v1".to_string(),
+                    model: "Qwen/Qwen3-8B-AWQ".to_string(),
+                    limit: args.limit,
                     force: false,
                 },
             )

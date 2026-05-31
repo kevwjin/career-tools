@@ -193,6 +193,12 @@ Daily default uses a 26-hour overlap:
 cargo run -- daily
 ```
 
+Weekly default uses an 8-day overlap:
+
+```bash
+cargo run -- weekly
+```
+
 Ingestion details:
 
 - Gmail query uses `after:<epoch_seconds> -in:drafts`.
@@ -369,10 +375,10 @@ Preflight:
 cargo run -- preflight
 ```
 
-Run the daily pipeline:
+Run the weekly pipeline:
 
 ```bash
-cargo run -- daily
+cargo run -- weekly
 ```
 
 Use a different vLLM endpoint:
@@ -389,32 +395,28 @@ CAREER_TOOLS_VLLM_MODEL='Qwen/Qwen3-8B-AWQ' cargo run -- process --dry-run
 
 ## Cron
 
-Example daily cron entry:
-
-```cron
-0 9 * * * cd /home/kevwjin/workspace/01-projects/career-tools && /home/kevwjin/.cargo/bin/cargo run -- daily >> /tmp/career-tools-daily.log 2>&1
-```
-
-Run vLLM separately before the cron job, or manage `scripts/serve-qwen-vllm.sh` with your preferred process manager.
-
-Example weekly report cron entry for Monday at 9 AM Pacific local time:
+Example weekly cron entry for Monday at 9 AM Pacific local time:
 
 ```cron
 CRON_TZ=America/Los_Angeles
-0 9 * * 1 cd /home/kevwjin/workspace/01-projects/career-tools && /home/kevwjin/.cargo/bin/cargo run -- report weekly --send >> /tmp/career-tools-weekly.log 2>&1
+CAREER_TOOLS_REPORT_TO=kevwjin@gmail.com
+CAREER_TOOLS_REPORT_CC=friend@example.com
+0 9 * * 1 cd /home/kevwjin/workspace/01-projects/career-tools && /home/kevwjin/.cargo/bin/cargo run -- weekly && /home/kevwjin/.cargo/bin/cargo run -- report weekly --send >> /tmp/career-tools-weekly.log 2>&1
 ```
+
+This pulls the last 8 days of Gmail, processes unhandled messages, then sends the previous completed Monday-Sunday report. Run vLLM separately before the cron job, or manage `scripts/serve-qwen-vllm.sh` with your preferred process manager.
 
 Set `CAREER_TOOLS_REPORT_TO` and optional `CAREER_TOOLS_REPORT_CC` in the crontab or shell environment used by cron.
 
 ## Current Limitations
 
-- Qwen/vLLM must already be running before `process` or `daily`.
+- Qwen/vLLM must already be running before `process`, `daily`, or `weekly`.
 - The vLLM profile is tuned for an 8 GB 3060 Ti and short prompts.
 - Body text is truncated before sending to the model.
 - The rejection/status guard is phrase-based substring matching, not a full classifier.
 - There is no CSV export yet.
 - There is no UI yet.
-- `cargo fmt` was not available in the current Rust toolchain during setup.
+- Use `nix develop` for rustfmt and clippy.
 
 ## Troubleshooting
 
