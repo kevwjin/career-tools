@@ -1120,7 +1120,7 @@ fn render_weekly_report(report: &WeeklyReport, _tz: Tz) -> RenderedReport {
     text.push_str("Hi Kevin,\n\n");
     text.push_str("It's time for your weekly career report! Let's see how well you did.\n\n");
     text.push_str(&format!(
-        "You applied to a total of {total} roles, averaging {:.2} per day. You applied to roles during {active_days} of the 7 days last week.\n",
+        "You applied to a total of {total} roles, averaging {:.2} per day. You applied to roles {active_days} out of the 7 days last week.\n",
         mean
     ));
     if !report.applications.is_empty() {
@@ -1136,15 +1136,15 @@ fn render_weekly_report(report: &WeeklyReport, _tz: Tz) -> RenderedReport {
     html.push_str("<p>Hi Kevin,</p>");
     html.push_str("<p>It's time for your weekly career report! Let's see how well you did.</p>");
     html.push_str(&format!(
-        "<p>You applied to a total of {total} roles, averaging {:.2} per day. You applied to roles during {active_days} of the 7 days last week.</p>",
+        "<p>You applied to a <strong>total of {total} roles</strong>, averaging {:.2} per day. You applied to roles <strong>{active_days} out of the 7</strong> days last week.</p>",
         mean
     ));
     if !report.applications.is_empty() {
         html.push_str("<p>Here's what you applied to:</p>");
-        html.push_str("<table><thead><tr><th>Company</th><th>Role</th></tr></thead><tbody>");
+        html.push_str("<table style=\"border-collapse: collapse; width: 100%;\"><thead><tr><th style=\"border: 1px solid #cccccc; padding: 6px; text-align: left;\">Company</th><th style=\"border: 1px solid #cccccc; padding: 6px; text-align: left;\">Role</th></tr></thead><tbody>");
         for app in &report.applications {
             html.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td></tr>",
+                "<tr><td style=\"border: 1px solid #cccccc; padding: 6px;\">{}</td><td style=\"border: 1px solid #cccccc; padding: 6px;\">{}</td></tr>",
                 html_escape(&app.company),
                 html_escape(&app.role)
             ));
@@ -1836,7 +1836,7 @@ mod tests {
         assert!(base_idx < apple_idx);
         assert!(rendered.text.contains("Hi Kevin,"));
         assert!(rendered.text.contains("You applied to a total of 2 roles"));
-        assert!(rendered.text.contains("during 2 of the 7 days"));
+        assert!(rendered.text.contains("2 out of the 7 days"));
         assert!(
             rendered
                 .text
@@ -1847,9 +1847,11 @@ mod tests {
                 .text
                 .contains("2. Apple - Software Engineering Masters Internships")
         );
-        assert!(!rendered.html.contains("<strong>"));
-        assert!(rendered.html.contains("<table>"));
-        assert!(rendered.html.contains("<th>Company</th><th>Role</th>"));
+        assert!(rendered.html.contains("<strong>total of 2 roles</strong>"));
+        assert!(rendered.html.contains("<strong>2 out of the 7</strong>"));
+        assert!(rendered.html.contains("<table style="));
+        assert!(rendered.html.contains("text-align: left;\">Company</th>"));
+        assert!(rendered.html.contains("border: 1px solid #cccccc"));
     }
 
     #[test]
