@@ -125,6 +125,8 @@ Start local Postgres:
 docker compose up -d
 ```
 
+The Compose service uses `restart: unless-stopped`. On this host, Docker is enabled under systemd, so the existing Postgres container restarts when Docker starts after a reboot.
+
 Apply migrations:
 
 ```bash

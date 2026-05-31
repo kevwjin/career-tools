@@ -2,6 +2,7 @@ services:
   postgres:
     image: postgres:16
     container_name: career-tools-postgres
+    restart: unless-stopped
     environment:
       POSTGRES_USER: career_tools
       POSTGRES_PASSWORD: career_tools
