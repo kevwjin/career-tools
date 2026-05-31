@@ -994,7 +994,11 @@ async fn weekly_report(pool: &PgPool, cfg: &AppConfig, args: WeeklyReportArgs) -
         bail!("--send requires at least one --to recipient or CAREER_TOOLS_REPORT_TO");
     }
 
-    let (week_start, week_end_exclusive) = previous_week_window(Utc::now(), Los_Angeles)?;
+    let (week_start, week_end_exclusive) = if send {
+        previous_week_window(Utc::now(), Los_Angeles)?
+    } else {
+        rolling_dry_run_window(Utc::now(), Los_Angeles)
+    };
     let report = load_weekly_report(pool, week_start, week_end_exclusive, Los_Angeles).await?;
     let rendered = render_weekly_report(&report, Los_Angeles);
 
@@ -1154,6 +1158,13 @@ fn previous_week_window(now_utc: DateTime<Utc>, tz: Tz) -> Result<(NaiveDate, Na
     let current_week_start = local_today - ChronoDuration::days(days_since_monday);
     let previous_week_start = current_week_start - ChronoDuration::days(7);
     Ok((previous_week_start, current_week_start))
+}
+
+fn rolling_dry_run_window(now_utc: DateTime<Utc>, tz: Tz) -> (NaiveDate, NaiveDate) {
+    let local_today = now_utc.with_timezone(&tz).date_naive();
+    let end_exclusive = local_today;
+    let start = end_exclusive - ChronoDuration::days(7);
+    (start, end_exclusive)
 }
 
 fn local_midnight(tz: Tz, date: NaiveDate) -> Result<DateTime<Tz>> {
@@ -1730,6 +1741,14 @@ mod tests {
         let (start, end_exclusive) = previous_week_window(now, Los_Angeles).unwrap();
         assert_eq!(start, NaiveDate::from_ymd_opt(2026, 5, 25).unwrap());
         assert_eq!(end_exclusive, NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
+    }
+
+    #[test]
+    fn rolling_dry_run_window_ends_yesterday() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 3, 16, 0, 0).single().unwrap();
+        let (start, end_exclusive) = rolling_dry_run_window(now, Los_Angeles);
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 5, 27).unwrap());
+        assert_eq!(end_exclusive, NaiveDate::from_ymd_opt(2026, 6, 3).unwrap());
     }
 
     #[test]

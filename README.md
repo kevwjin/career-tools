@@ -311,7 +311,7 @@ cargo run -- inspect applications --limit 20
 
 ## Weekly Email Report
 
-The weekly report summarizes the previous completed Monday-Sunday week in `America/Los_Angeles` time. It counts only tracked submission confirmation rows in `job_applications`; rejection and later status emails remain excluded.
+The sent weekly report summarizes the previous completed Monday-Sunday week in `America/Los_Angeles` time. Dry runs preview the rolling 7-day window from 7 days ago through yesterday. Reports count only tracked submission confirmation rows in `job_applications`; rejection and later status emails remain excluded.
 
 Preview the report without sending:
 
