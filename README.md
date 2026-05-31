@@ -34,6 +34,7 @@ There is a deterministic phrase guard for obvious rejection/status-update langua
 ## Requirements
 
 - Rust/Cargo
+- Nix, optional but recommended for the pinned Rust dev shell
 - Docker with Compose
 - `uv`
 - NVIDIA GPU with working driver/CUDA visibility
@@ -53,6 +54,22 @@ Check GPU visibility:
 
 ```bash
 nvidia-smi
+```
+
+## Rust Dev Shell
+
+The repo includes a Nix flake with Cargo, rustc, rustfmt, clippy, rust-analyzer, pkg-config, and glib:
+
+```bash
+nix develop
+```
+
+Run checks through the flake:
+
+```bash
+nix develop --command cargo fmt --check
+nix develop --command cargo clippy -- -D warnings
+nix develop --command cargo test
 ```
 
 ## Google Cloud / Gmail API Setup

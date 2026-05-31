@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -19,14 +19,20 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use url::Url;
 
-const GMAIL_SCOPES: &str = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send";
+const GMAIL_SCOPES: &str =
+    "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send";
 const PROMPT_VERSION: &str = "applied-v1";
 
 #[derive(Parser)]
 #[command(name = "career-tools")]
 #[command(about = "Local Gmail job application tracker")]
 struct Cli {
-    #[arg(long, env = "CAREER_TOOLS_DATABASE_URL", global = true, default_value = "postgres://career_tools:career_tools@localhost:5432/career_tools")]
+    #[arg(
+        long,
+        env = "CAREER_TOOLS_DATABASE_URL",
+        global = true,
+        default_value = "postgres://career_tools:career_tools@localhost:5432/career_tools"
+    )]
     database_url: String,
 
     #[arg(long, env = "CAREER_TOOLS_CONFIG_DIR", global = true)]
@@ -80,10 +86,18 @@ struct ProcessArgs {
     #[arg(long, default_value_t = false)]
     dry_run: bool,
 
-    #[arg(long, env = "CAREER_TOOLS_VLLM_BASE_URL", default_value = "http://127.0.0.1:8000/v1")]
+    #[arg(
+        long,
+        env = "CAREER_TOOLS_VLLM_BASE_URL",
+        default_value = "http://127.0.0.1:8000/v1"
+    )]
     vllm_base_url: String,
 
-    #[arg(long, env = "CAREER_TOOLS_VLLM_MODEL", default_value = "Qwen/Qwen3-8B-AWQ")]
+    #[arg(
+        long,
+        env = "CAREER_TOOLS_VLLM_MODEL",
+        default_value = "Qwen/Qwen3-8B-AWQ"
+    )]
     model: String,
 
     #[arg(long, default_value_t = 25)]
@@ -260,6 +274,16 @@ struct RenderedReport {
     content_hash: String,
 }
 
+struct ReportSendRecord<'a> {
+    report_type: &'a str,
+    week_start: NaiveDate,
+    week_end: NaiveDate,
+    to_addrs: &'a [String],
+    cc_addrs: &'a [String],
+    content_hash: &'a str,
+    gmail_message_id: Option<&'a str>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -375,7 +399,7 @@ async fn preflight(database_url: &str, cfg: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-fn check_file(label: &str, path: &PathBuf) {
+fn check_file(label: &str, path: &Path) {
     if path.exists() {
         println!("{label}: {}", path.display());
     } else {
@@ -399,7 +423,8 @@ async fn gmail_auth(cfg: &AppConfig, args: GmailAuthArgs) -> Result<()> {
     let redirect_uri = format!("http://{}", listener.local_addr()?);
 
     let mut auth_url = Url::parse(&oauth.auth_uri)?;
-    auth_url.query_pairs_mut()
+    auth_url
+        .query_pairs_mut()
         .append_pair("client_id", &oauth.client_id)
         .append_pair("redirect_uri", &redirect_uri)
         .append_pair("response_type", "code")
@@ -424,7 +449,8 @@ fn parse_manual_callback(callback_url: &str) -> Result<(String, String)> {
         .replace("\\?", "?")
         .replace("\\=", "=")
         .replace("\\&", "&");
-    let url = Url::parse(&callback_url).context("callback URL must be the full localhost URL from the browser")?;
+    let url = Url::parse(&callback_url)
+        .context("callback URL must be the full localhost URL from the browser")?;
     let code = url
         .query_pairs()
         .find_map(|(key, value)| (key == "code").then(|| value.into_owned()))
@@ -468,7 +494,11 @@ async fn wait_for_oauth_code(listener: TcpListener) -> Result<String> {
         .ok_or_else(|| anyhow!("OAuth callback did not include a code"))
 }
 
-async fn exchange_code_for_token(oauth: &OAuthClient, code: &str, redirect_uri: &str) -> Result<StoredToken> {
+async fn exchange_code_for_token(
+    oauth: &OAuthClient,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<StoredToken> {
     let client = Client::new();
     let response: TokenResponse = client
         .post(&oauth.token_uri)
@@ -542,7 +572,9 @@ async fn ingest(pool: &PgPool, cfg: &AppConfig, hours: u64) -> Result<()> {
 
 async fn fetch_message(client: &Client, token: &str, id: &str) -> Result<GmailMessage> {
     client
-        .get(format!("https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}"))
+        .get(format!(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}"
+        ))
         .bearer_auth(token)
         .query(&[("format", "full")])
         .send()
@@ -657,18 +689,24 @@ async fn process(pool: &PgPool, args: ProcessArgs) -> Result<()> {
             snippet.as_deref(),
             body_text.as_deref(),
         );
-        let is_later_status_update = is_later_status_update(
-            subject.as_deref(),
-            snippet.as_deref(),
-            body_text.as_deref(),
-        );
+        let is_later_status_update =
+            is_later_status_update(subject.as_deref(), snippet.as_deref(), body_text.as_deref());
 
         let result = call_vllm(&client, &args.vllm_base_url, &args.model, &prompt).await;
         match result {
             Ok((raw, parsed)) => {
                 let decision = extraction_decision(&parsed, is_later_status_update);
-                upsert_attempt(pool, &gmail_message_id, &args.model, &raw, &parsed, &decision, None).await?;
-        if !args.dry_run && decision == "tracked_applied" {
+                upsert_attempt(
+                    pool,
+                    &gmail_message_id,
+                    &args.model,
+                    &raw,
+                    &parsed,
+                    decision,
+                    None,
+                )
+                .await?;
+                if !args.dry_run && decision == "tracked_applied" {
                     upsert_application(pool, &gmail_message_id, &gmail_thread_id, &parsed).await?;
                 }
                 println!("{gmail_message_id}: {decision}");
@@ -682,9 +720,14 @@ async fn process(pool: &PgPool, args: ProcessArgs) -> Result<()> {
     Ok(())
 }
 
-fn extraction_prompt(from: Option<&str>, subject: Option<&str>, snippet: Option<&str>, body: Option<&str>) -> String {
-        let body = body.unwrap_or("").chars().take(500).collect::<String>();
-        format!(
+fn extraction_prompt(
+    from: Option<&str>,
+    subject: Option<&str>,
+    snippet: Option<&str>,
+    body: Option<&str>,
+) -> String {
+    let body = body.unwrap_or("").chars().take(500).collect::<String>();
+    format!(
         r#"/no_think
 You extract job application submission confirmations.
 
@@ -720,7 +763,12 @@ Body:
     )
 }
 
-async fn call_vllm(client: &Client, base_url: &str, model: &str, prompt: &str) -> Result<(Value, AppliedExtraction)> {
+async fn call_vllm(
+    client: &Client,
+    base_url: &str,
+    model: &str,
+    prompt: &str,
+) -> Result<(Value, AppliedExtraction)> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let request = json!({
         "model": model,
@@ -731,7 +779,10 @@ async fn call_vllm(client: &Client, base_url: &str, model: &str, prompt: &str) -
         "temperature": 0,
         "max_tokens": 160
     });
-    let raw: Value = error_for_status_with_body(client.post(url).json(&request).send().await?).await?.json().await?;
+    let raw: Value = error_for_status_with_body(client.post(url).json(&request).send().await?)
+        .await?
+        .json()
+        .await?;
     let content = raw["choices"][0]["message"]["content"]
         .as_str()
         .context("vLLM response did not include choices[0].message.content")?;
@@ -766,13 +817,18 @@ fn extraction_decision(parsed: &AppliedExtraction, is_later_status_update: bool)
     if !parsed.is_applied {
         return "skipped_not_application";
     }
-    if parsed.confidence < 0.75 || blank(parsed.company.as_deref()) || blank(parsed.role.as_deref()) {
+    if parsed.confidence < 0.75 || blank(parsed.company.as_deref()) || blank(parsed.role.as_deref())
+    {
         return "skipped_uncertain";
     }
     "tracked_applied"
 }
 
-fn is_later_status_update(subject: Option<&str>, snippet: Option<&str>, body: Option<&str>) -> bool {
+fn is_later_status_update(
+    subject: Option<&str>,
+    snippet: Option<&str>,
+    body: Option<&str>,
+) -> bool {
     let text = format!(
         "{}\n{}\n{}",
         subject.unwrap_or(""),
@@ -793,9 +849,7 @@ fn is_later_status_update(subject: Option<&str>, snippet: Option<&str>, body: Op
         "regret to inform",
     ];
 
-    rejection_markers
-        .iter()
-        .any(|marker| text.contains(marker))
+    rejection_markers.iter().any(|marker| text.contains(marker))
 }
 
 fn blank(value: Option<&str>) -> bool {
@@ -846,9 +900,20 @@ async fn upsert_attempt(
     Ok(())
 }
 
-async fn upsert_application(pool: &PgPool, gmail_message_id: &str, gmail_thread_id: &str, parsed: &AppliedExtraction) -> Result<()> {
-    let company = parsed.company.as_ref().context("tracked extraction missing company")?;
-    let role = parsed.role.as_ref().context("tracked extraction missing role")?;
+async fn upsert_application(
+    pool: &PgPool,
+    gmail_message_id: &str,
+    gmail_thread_id: &str,
+    parsed: &AppliedExtraction,
+) -> Result<()> {
+    let company = parsed
+        .company
+        .as_ref()
+        .context("tracked extraction missing company")?;
+    let role = parsed
+        .role
+        .as_ref()
+        .context("tracked extraction missing role")?;
     let application_key = application_key(
         company,
         role,
@@ -921,20 +986,32 @@ async fn weekly_report(pool: &PgPool, cfg: &AppConfig, args: WeeklyReportArgs) -
 
     let oauth = read_oauth_client(cfg)?;
     let token = access_token(cfg, &oauth).await?;
-    let mime = build_mime_message(&to_addrs, &cc_addrs, &rendered.subject, &rendered.text, &rendered.html);
+    let mime = build_mime_message(
+        &to_addrs,
+        &cc_addrs,
+        &rendered.subject,
+        &rendered.text,
+        &rendered.html,
+    );
     let gmail_id = send_gmail_message(&token, &mime).await?;
     record_report_send(
         pool,
-        "weekly",
-        week_start,
-        week_end,
-        &to_addrs,
-        &cc_addrs,
-        &rendered.content_hash,
-        gmail_id.as_deref(),
+        ReportSendRecord {
+            report_type: "weekly",
+            week_start,
+            week_end,
+            to_addrs: &to_addrs,
+            cc_addrs: &cc_addrs,
+            content_hash: &rendered.content_hash,
+            gmail_message_id: gmail_id.as_deref(),
+        },
     )
     .await?;
-    println!("sent weekly report for {} to {}", week_start, to_addrs.join(", "));
+    println!(
+        "sent weekly report for {} to {}",
+        week_start,
+        to_addrs.join(", ")
+    );
     Ok(())
 }
 
@@ -987,7 +1064,11 @@ fn render_weekly_report(report: &WeeklyReport, tz: Tz) -> RenderedReport {
     let mean = mean(&report.daily_counts);
     let median = median(&report.daily_counts);
     let max = report.daily_counts.iter().copied().max().unwrap_or(0);
-    let active_days = report.daily_counts.iter().filter(|count| **count > 0).count();
+    let active_days = report
+        .daily_counts
+        .iter()
+        .filter(|count| **count > 0)
+        .count();
     let subject = format!(
         "Career tools weekly report: {}-{}",
         report.week_start.format("%b %-d"),
@@ -1019,17 +1100,29 @@ fn render_weekly_report(report: &WeeklyReport, tz: Tz) -> RenderedReport {
     html.push_str("<!doctype html><html><body>");
     html.push_str(&format!("<h1>{}</h1>", html_escape(&subject)));
     html.push_str("<ul>");
-    html.push_str(&format!("<li><strong>Total applications:</strong> {total}</li>"));
-    html.push_str(&format!("<li><strong>Mean per day:</strong> {:.2}</li>", mean));
-    html.push_str(&format!("<li><strong>Median per day:</strong> {:.2}</li>", median));
+    html.push_str(&format!(
+        "<li><strong>Total applications:</strong> {total}</li>"
+    ));
+    html.push_str(&format!(
+        "<li><strong>Mean per day:</strong> {:.2}</li>",
+        mean
+    ));
+    html.push_str(&format!(
+        "<li><strong>Median per day:</strong> {:.2}</li>",
+        median
+    ));
     html.push_str(&format!("<li><strong>Max in a day:</strong> {max}</li>"));
-    html.push_str(&format!("<li><strong>Active days:</strong> {active_days}/7</li>"));
+    html.push_str(&format!(
+        "<li><strong>Active days:</strong> {active_days}/7</li>"
+    ));
     html.push_str("</ul>");
     html.push_str("<h2>Applications</h2>");
     if report.applications.is_empty() {
         html.push_str("<p>None</p>");
     } else {
-        html.push_str("<table><thead><tr><th>Date</th><th>Company</th><th>Role</th></tr></thead><tbody>");
+        html.push_str(
+            "<table><thead><tr><th>Date</th><th>Company</th><th>Role</th></tr></thead><tbody>",
+        );
         for app in &report.applications {
             html.push_str(&format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
@@ -1091,7 +1184,7 @@ fn median(values: &[i64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_unstable();
     let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         (sorted[mid - 1] + sorted[mid]) as f64 / 2.0
     } else {
         sorted[mid] as f64
@@ -1110,8 +1203,17 @@ fn parse_recipient_list(value: Option<&str>) -> Vec<String> {
     recipients
 }
 
-fn build_mime_message(to_addrs: &[String], cc_addrs: &[String], subject: &str, text: &str, html: &str) -> String {
-    let boundary = format!("career-tools-{}", hash_text(subject).chars().take(16).collect::<String>());
+fn build_mime_message(
+    to_addrs: &[String],
+    cc_addrs: &[String],
+    subject: &str,
+    text: &str,
+    html: &str,
+) -> String {
+    let boundary = format!(
+        "career-tools-{}",
+        hash_text(subject).chars().take(16).collect::<String>()
+    );
     let mut message = String::new();
     message.push_str(&format!("To: {}\r\n", to_addrs.join(", ")));
     if !cc_addrs.is_empty() {
@@ -1119,7 +1221,10 @@ fn build_mime_message(to_addrs: &[String], cc_addrs: &[String], subject: &str, t
     }
     message.push_str(&format!("Subject: {}\r\n", subject));
     message.push_str("MIME-Version: 1.0\r\n");
-    message.push_str(&format!("Content-Type: multipart/alternative; boundary=\"{}\"\r\n", boundary));
+    message.push_str(&format!(
+        "Content-Type: multipart/alternative; boundary=\"{}\"\r\n",
+        boundary
+    ));
     message.push_str("\r\n");
     message.push_str(&format!("--{}\r\n", boundary));
     message.push_str("Content-Type: text/plain; charset=\"UTF-8\"\r\n");
@@ -1178,16 +1283,7 @@ async fn report_send_exists(
     Ok(exists)
 }
 
-async fn record_report_send(
-    pool: &PgPool,
-    report_type: &str,
-    week_start: NaiveDate,
-    week_end: NaiveDate,
-    to_addrs: &[String],
-    cc_addrs: &[String],
-    content_hash: &str,
-    gmail_message_id: Option<&str>,
-) -> Result<()> {
+async fn record_report_send(pool: &PgPool, record: ReportSendRecord<'_>) -> Result<()> {
     sqlx::query(
         r#"
         INSERT INTO report_sends (
@@ -1202,13 +1298,13 @@ async fn record_report_send(
             sent_at = NOW()
         "#,
     )
-    .bind(report_type)
-    .bind(week_start)
-    .bind(week_end)
-    .bind(to_addrs)
-    .bind(cc_addrs)
-    .bind(content_hash)
-    .bind(gmail_message_id)
+    .bind(record.report_type)
+    .bind(record.week_start)
+    .bind(record.week_end)
+    .bind(record.to_addrs)
+    .bind(record.cc_addrs)
+    .bind(record.content_hash)
+    .bind(record.gmail_message_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -1254,7 +1350,8 @@ async fn inspect_emails(pool: &PgPool, limit: i64) -> Result<()> {
             "{} | thread={} | {} | {} | {}",
             id,
             thread,
-            date.map(|d| d.to_rfc3339()).unwrap_or_else(|| "-".to_string()),
+            date.map(|d| d.to_rfc3339())
+                .unwrap_or_else(|| "-".to_string()),
             from.unwrap_or_else(|| "-".to_string()),
             subject.unwrap_or_else(|| "-".to_string())
         );
@@ -1279,14 +1376,23 @@ async fn inspect_email(pool: &PgPool, gmail_message_id: &str) -> Result<()> {
     let body: Option<String> = row.get("body_text");
     println!("id: {}", row.get::<String, _>("gmail_message_id"));
     println!("thread: {}", row.get::<String, _>("gmail_thread_id"));
-    println!("internal_date: {:?}", row.get::<Option<DateTime<Utc>>, _>("internal_date"));
+    println!(
+        "internal_date: {:?}",
+        row.get::<Option<DateTime<Utc>>, _>("internal_date")
+    );
     println!("from: {:?}", row.get::<Option<String>, _>("from_addr"));
     println!("to: {:?}", row.get::<Vec<String>, _>("to_addrs"));
     println!("cc: {:?}", row.get::<Vec<String>, _>("cc_addrs"));
     println!("subject: {:?}", row.get::<Option<String>, _>("subject"));
     println!("labels: {:?}", row.get::<Vec<String>, _>("label_ids"));
     println!("snippet: {:?}", row.get::<Option<String>, _>("snippet"));
-    println!("\nbody preview:\n{}", body.unwrap_or_default().chars().take(4000).collect::<String>());
+    println!(
+        "\nbody preview:\n{}",
+        body.unwrap_or_default()
+            .chars()
+            .take(4000)
+            .collect::<String>()
+    );
     Ok(())
 }
 
@@ -1387,8 +1493,12 @@ fn read_oauth_client(cfg: &AppConfig) -> Result<OAuthClient> {
 }
 
 fn read_token(cfg: &AppConfig) -> Result<StoredToken> {
-    let text = fs::read_to_string(&cfg.token_path)
-        .with_context(|| format!("missing Gmail token at {}; run gmail-auth", cfg.token_path.display()))?;
+    let text = fs::read_to_string(&cfg.token_path).with_context(|| {
+        format!(
+            "missing Gmail token at {}; run gmail-auth",
+            cfg.token_path.display()
+        )
+    })?;
     serde_json::from_str(&text).context("invalid stored Gmail token")
 }
 
@@ -1425,14 +1535,12 @@ fn normalized_body(message: &GmailMessage) -> Option<String> {
 
 fn collect_text_parts(payload: &GmailPayload, chunks: &mut Vec<String>) {
     let mime = payload.mime_type.as_deref().unwrap_or("");
-    if (mime == "text/plain" || mime == "text/html") && payload.body.as_ref().and_then(|b| b.data.as_ref()).is_some() {
-        if let Some(data) = payload.body.as_ref().and_then(|b| b.data.as_ref()) {
-            if let Ok(bytes) = URL_SAFE_NO_PAD.decode(data) {
-                if let Ok(text) = String::from_utf8(bytes) {
-                    chunks.push(text);
-                }
-            }
-        }
+    if (mime == "text/plain" || mime == "text/html")
+        && let Some(data) = payload.body.as_ref().and_then(|b| b.data.as_ref())
+        && let Ok(bytes) = URL_SAFE_NO_PAD.decode(data)
+        && let Ok(text) = String::from_utf8(bytes)
+    {
+        chunks.push(text);
     }
     for part in payload.parts.as_deref().unwrap_or(&[]) {
         collect_text_parts(part, chunks);
@@ -1480,7 +1588,11 @@ fn parse_internal_date(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
         return Ok(None);
     };
     let millis = value.parse::<i64>()?;
-    Ok(Some(Utc.timestamp_millis_opt(millis).single().context("invalid Gmail internalDate")?))
+    Ok(Some(
+        Utc.timestamp_millis_opt(millis)
+            .single()
+            .context("invalid Gmail internalDate")?,
+    ))
 }
 
 fn hash_text(input: &str) -> String {
@@ -1489,8 +1601,16 @@ fn hash_text(input: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn application_key(company: &str, role: &str, location: Option<&str>, job_posting_url: Option<&str>) -> String {
-    if let Some(url) = job_posting_url.and_then(|u| nonempty(u)).filter(|u| !is_generic_job_host(u)) {
+fn application_key(
+    company: &str,
+    role: &str,
+    location: Option<&str>,
+    job_posting_url: Option<&str>,
+) -> String {
+    if let Some(url) = job_posting_url
+        .and_then(|u| nonempty(u))
+        .filter(|u| !is_generic_job_host(u))
+    {
         return format!("url:{}", normalize_key_part(url));
     }
     format!(
@@ -1571,13 +1691,23 @@ mod tests {
 
     #[test]
     fn application_key_prefers_url() {
-        let key = application_key("Acme", "Backend Engineer", None, Some("https://jobs.example.com/123"));
+        let key = application_key(
+            "Acme",
+            "Backend Engineer",
+            None,
+            Some("https://jobs.example.com/123"),
+        );
         assert_eq!(key, "url:https jobs example com 123");
     }
 
     #[test]
     fn application_key_ignores_generic_job_host_url() {
-        let key = application_key("Reply", "iOS Developer Intern", None, Some("https://hire.lever.co"));
+        let key = application_key(
+            "Reply",
+            "iOS Developer Intern",
+            None,
+            Some("https://hire.lever.co"),
+        );
         assert_eq!(key, "company:reply|role:ios developer intern|location:");
     }
 
@@ -1589,7 +1719,10 @@ mod tests {
     #[test]
     fn extracts_json_after_think_block() {
         let content = "<think>reasoning</think>\n{\"is_applied\":false}";
-        assert_eq!(extract_json_object(content).unwrap(), "{\"is_applied\":false}");
+        assert_eq!(
+            extract_json_object(content).unwrap(),
+            "{\"is_applied\":false}"
+        );
     }
 
     #[test]
@@ -1688,7 +1821,9 @@ mod tests {
 
     #[test]
     fn normalizes_recipients_for_duplicate_detection() {
-        let recipients = parse_recipient_list(Some("Friend@Example.com, me@example.com, friend@example.com"));
+        let recipients = parse_recipient_list(Some(
+            "Friend@Example.com, me@example.com, friend@example.com",
+        ));
         assert_eq!(recipients, vec!["friend@example.com", "me@example.com"]);
     }
 
