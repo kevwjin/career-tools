@@ -91,6 +91,9 @@ struct LeetcodeIngestArgs {
     #[arg(long, env = "CAREER_TOOLS_LEETCODE_USERNAME")]
     username: String,
 
+    #[arg(long, env = "CAREER_TOOLS_LEETCODE_SESSION")]
+    session: Option<String>,
+
     #[arg(long, default_value_t = 8)]
     days: u64,
 
@@ -278,6 +281,20 @@ struct LeetcodeSubmission {
     #[serde(rename = "titleSlug")]
     title_slug: String,
     timestamp: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LeetcodeApiSubmissionsResponse {
+    submissions_dump: Vec<LeetcodeApiSubmission>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LeetcodeApiSubmission {
+    id: i64,
+    title: String,
+    title_slug: String,
+    timestamp: i64,
+    status_display: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -723,7 +740,14 @@ async fn upsert_message(pool: &PgPool, message: &GmailMessage) -> Result<()> {
 async fn leetcode(pool: &PgPool, command: LeetcodeCommand) -> Result<()> {
     match command {
         LeetcodeCommand::Ingest(args) => {
-            ingest_leetcode(pool, &args.username, args.days, args.limit).await
+            ingest_leetcode(
+                pool,
+                &args.username,
+                args.session.as_deref(),
+                args.days,
+                args.limit,
+            )
+            .await
         }
     }
 }
@@ -734,7 +758,7 @@ async fn maybe_ingest_leetcode(pool: &PgPool, hours: u64) -> Result<()> {
         return Ok(());
     };
     let days = hours.div_ceil(24).max(1);
-    ingest_leetcode(pool, &username, days, 200).await
+    ingest_leetcode(pool, &username, leetcode_session().as_deref(), days, 200).await
 }
 
 fn leetcode_username() -> Option<String> {
@@ -744,8 +768,21 @@ fn leetcode_username() -> Option<String> {
         .filter(|username| !username.is_empty())
 }
 
-async fn ingest_leetcode(pool: &PgPool, username: &str, days: u64, limit: i64) -> Result<()> {
-    let submissions = fetch_leetcode_submissions(username, limit).await?;
+fn leetcode_session() -> Option<String> {
+    env::var("CAREER_TOOLS_LEETCODE_SESSION")
+        .ok()
+        .map(|session| session.trim().to_string())
+        .filter(|session| !session.is_empty())
+}
+
+async fn ingest_leetcode(
+    pool: &PgPool,
+    username: &str,
+    session: Option<&str>,
+    days: u64,
+    limit: i64,
+) -> Result<()> {
+    let submissions = fetch_leetcode_submissions(username, session, limit).await?;
     let after = Utc::now() - ChronoDuration::days(days as i64);
     let mut seen = 0usize;
     let mut upserted = 0usize;
@@ -764,7 +801,21 @@ async fn ingest_leetcode(pool: &PgPool, username: &str, days: u64, limit: i64) -
     Ok(())
 }
 
-async fn fetch_leetcode_submissions(username: &str, limit: i64) -> Result<Vec<LeetcodeSubmission>> {
+async fn fetch_leetcode_submissions(
+    username: &str,
+    session: Option<&str>,
+    limit: i64,
+) -> Result<Vec<LeetcodeSubmission>> {
+    if let Some(session) = session {
+        return fetch_authenticated_leetcode_submissions(session, limit).await;
+    }
+    fetch_public_leetcode_submissions(username, limit).await
+}
+
+async fn fetch_public_leetcode_submissions(
+    username: &str,
+    limit: i64,
+) -> Result<Vec<LeetcodeSubmission>> {
     let request = json!({
         "query": r#"
             query recentAcSubmissions($username: String!, $limit: Int!) {
@@ -800,6 +851,34 @@ async fn fetch_leetcode_submissions(username: &str, limit: i64) -> Result<Vec<Le
         .data
         .map(|data| data.recent_ac_submission_list)
         .unwrap_or_default())
+}
+
+async fn fetch_authenticated_leetcode_submissions(
+    session: &str,
+    limit: i64,
+) -> Result<Vec<LeetcodeSubmission>> {
+    let response: LeetcodeApiSubmissionsResponse = Client::new()
+        .get("https://leetcode.com/api/submissions/")
+        .header("Cookie", format!("LEETCODE_SESSION={session}"))
+        .query(&[("offset", "0".to_string()), ("limit", limit.to_string())])
+        .send()
+        .await?
+        .pipe(error_for_status_with_body)
+        .await?
+        .json()
+        .await?;
+
+    Ok(response
+        .submissions_dump
+        .into_iter()
+        .filter(|submission| submission.status_display == "Accepted")
+        .map(|submission| LeetcodeSubmission {
+            id: submission.id.to_string(),
+            title: submission.title,
+            title_slug: submission.title_slug,
+            timestamp: submission.timestamp.to_string(),
+        })
+        .collect())
 }
 
 async fn upsert_leetcode_submission(

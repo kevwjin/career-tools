@@ -218,10 +218,18 @@ cargo run -- inspect email <gmail_message_id>
 
 ## Ingest LeetCode
 
-LeetCode tracking uses the public GraphQL API and only needs your username:
+LeetCode tracking can use the public GraphQL API with only your username:
 
 ```bash
 export CAREER_TOOLS_LEETCODE_USERNAME='your_leetcode_username'
+cargo run -- leetcode ingest --days 8
+```
+
+If the public API does not expose your recent accepted submissions, use your logged-in `LEETCODE_SESSION` cookie:
+
+```bash
+export CAREER_TOOLS_LEETCODE_USERNAME='your_leetcode_username'
+export CAREER_TOOLS_LEETCODE_SESSION='paste_cookie_value_here'
 cargo run -- leetcode ingest --days 8
 ```
 
@@ -231,7 +239,7 @@ Inspect stored accepted submissions:
 cargo run -- inspect leetcode --limit 20
 ```
 
-The weekly pipeline automatically ingests LeetCode when `CAREER_TOOLS_LEETCODE_USERNAME` is set. If it is unset, LeetCode ingest and report content are skipped without failing cron.
+The weekly pipeline automatically ingests LeetCode when `CAREER_TOOLS_LEETCODE_USERNAME` is set. If `CAREER_TOOLS_LEETCODE_SESSION` is set, it uses the authenticated Practice History endpoint; otherwise it falls back to public GraphQL. If the username is unset, LeetCode ingest and report content are skipped without failing cron.
 
 ## vLLM / Qwen Setup
 
@@ -434,12 +442,13 @@ CRON_TZ=America/Los_Angeles
 CAREER_TOOLS_REPORT_TO=kevwjin@gmail.com
 CAREER_TOOLS_REPORT_CC=friend@example.com
 CAREER_TOOLS_LEETCODE_USERNAME=your_leetcode_username
+CAREER_TOOLS_LEETCODE_SESSION=paste_cookie_value_here
 0 9 * * 1 cd /home/kevwjin/workspace/01-projects/career-tools && scripts/ensure-qwen-vllm.sh && /home/kevwjin/.nix-profile/bin/cargo run -- weekly && /home/kevwjin/.nix-profile/bin/cargo run -- report weekly --send >> /tmp/career-tools-weekly.log 2>&1
 ```
 
 This starts vLLM if needed, pulls the last 8 days of Gmail and LeetCode activity, processes unhandled messages, then sends the previous completed Monday-Sunday report.
 
-Set `CAREER_TOOLS_REPORT_TO`, optional `CAREER_TOOLS_REPORT_CC`, and optional `CAREER_TOOLS_LEETCODE_USERNAME` in the crontab or shell environment used by cron.
+Set `CAREER_TOOLS_REPORT_TO`, optional `CAREER_TOOLS_REPORT_CC`, optional `CAREER_TOOLS_LEETCODE_USERNAME`, and optional `CAREER_TOOLS_LEETCODE_SESSION` in the crontab or shell environment used by cron.
 
 ## Current Limitations
 
