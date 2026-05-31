@@ -1087,11 +1087,9 @@ async fn load_weekly_report(
     })
 }
 
-fn render_weekly_report(report: &WeeklyReport, tz: Tz) -> RenderedReport {
+fn render_weekly_report(report: &WeeklyReport, _tz: Tz) -> RenderedReport {
     let total: i64 = report.daily_counts.iter().sum();
     let mean = mean(&report.daily_counts);
-    let median = median(&report.daily_counts);
-    let max = report.daily_counts.iter().copied().max().unwrap_or(0);
     let active_days = report
         .daily_counts
         .iter()
@@ -1104,63 +1102,41 @@ fn render_weekly_report(report: &WeeklyReport, tz: Tz) -> RenderedReport {
     );
 
     let mut text = String::new();
-    text.push_str(&format!("{}\n\n", subject));
-    text.push_str(&format!("Total applications: {total}\n"));
-    text.push_str(&format!("Mean per day: {:.2}\n", mean));
-    text.push_str(&format!("Median per day: {:.2}\n", median));
-    text.push_str(&format!("Max in a day: {max}\n"));
-    text.push_str(&format!("Active days: {active_days}/7\n\n"));
-    text.push_str("Applications:\n");
-    if report.applications.is_empty() {
-        text.push_str("- None\n");
-    } else {
-        for app in &report.applications {
-            text.push_str(&format!(
-                "- {}: {} - {}\n",
-                app.submitted_at.with_timezone(&tz).date_naive(),
-                app.company,
-                app.role
-            ));
+    text.push_str("Hi Kevin,\n\n");
+    text.push_str("It's time for your weekly career report! Let's see how well you did.\n\n");
+    text.push_str(&format!(
+        "You applied to a total of {total} roles, averaging {:.2} per day. You applied to roles during {active_days} of the 7 days last week.\n",
+        mean
+    ));
+    if !report.applications.is_empty() {
+        text.push_str("\nHere's what you applied to:\n\n");
+        for (idx, app) in report.applications.iter().enumerate() {
+            text.push_str(&format!("{}. {} - {}\n", idx + 1, app.company, app.role));
         }
     }
+    text.push_str("\nBest,\nCareer-Bot\n");
 
     let mut html = String::new();
     html.push_str("<!doctype html><html><body>");
-    html.push_str(&format!("<h1>{}</h1>", html_escape(&subject)));
-    html.push_str("<ul>");
+    html.push_str("<p>Hi Kevin,</p>");
+    html.push_str("<p>It's time for your weekly career report! Let's see how well you did.</p>");
     html.push_str(&format!(
-        "<li><strong>Total applications:</strong> {total}</li>"
-    ));
-    html.push_str(&format!(
-        "<li><strong>Mean per day:</strong> {:.2}</li>",
+        "<p>You applied to a total of {total} roles, averaging {:.2} per day. You applied to roles during {active_days} of the 7 days last week.</p>",
         mean
     ));
-    html.push_str(&format!(
-        "<li><strong>Median per day:</strong> {:.2}</li>",
-        median
-    ));
-    html.push_str(&format!("<li><strong>Max in a day:</strong> {max}</li>"));
-    html.push_str(&format!(
-        "<li><strong>Active days:</strong> {active_days}/7</li>"
-    ));
-    html.push_str("</ul>");
-    html.push_str("<h2>Applications</h2>");
-    if report.applications.is_empty() {
-        html.push_str("<p>None</p>");
-    } else {
-        html.push_str(
-            "<table><thead><tr><th>Date</th><th>Company</th><th>Role</th></tr></thead><tbody>",
-        );
+    if !report.applications.is_empty() {
+        html.push_str("<p>Here's what you applied to:</p>");
+        html.push_str("<table><thead><tr><th>Company</th><th>Role</th></tr></thead><tbody>");
         for app in &report.applications {
             html.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
-                app.submitted_at.with_timezone(&tz).date_naive(),
+                "<tr><td>{}</td><td>{}</td></tr>",
                 html_escape(&app.company),
                 html_escape(&app.role)
             ));
         }
         html.push_str("</tbody></table>");
     }
+    html.push_str("<p>Best,<br>Career-Bot</p>");
     html.push_str("</body></html>");
 
     let content_hash = hash_text(&format!("{subject}\n{text}\n{html}"));
@@ -1203,20 +1179,6 @@ fn mean(values: &[i64]) -> f64 {
         return 0.0;
     }
     values.iter().sum::<i64>() as f64 / values.len() as f64
-}
-
-fn median(values: &[i64]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    let mut sorted = values.to_vec();
-    sorted.sort_unstable();
-    let mid = sorted.len() / 2;
-    if sorted.len().is_multiple_of(2) {
-        (sorted[mid - 1] + sorted[mid]) as f64 / 2.0
-    } else {
-        sorted[mid] as f64
-    }
 }
 
 fn parse_recipient_list(value: Option<&str>) -> Vec<String> {
@@ -1806,7 +1768,6 @@ mod tests {
         let counts = daily_counts(week_start, &applications, Los_Angeles);
         assert_eq!(counts, vec![2, 0, 1, 0, 0, 0, 0]);
         assert_eq!(mean(&counts), 3.0 / 7.0);
-        assert_eq!(median(&counts), 0.0);
         assert_eq!(counts.iter().copied().max().unwrap(), 2);
         assert_eq!(counts.iter().filter(|count| **count > 0).count(), 2);
     }
@@ -1843,8 +1804,37 @@ mod tests {
         let base_idx = rendered.text.find("Base Power Company").unwrap();
         let apple_idx = rendered.text.find("Apple").unwrap();
         assert!(base_idx < apple_idx);
-        assert!(rendered.text.contains("Total applications: 2"));
-        assert!(rendered.text.contains("Active days: 2/7"));
+        assert!(rendered.text.contains("Hi Kevin,"));
+        assert!(rendered.text.contains("You applied to a total of 2 roles"));
+        assert!(rendered.text.contains("during 2 of the 7 days"));
+        assert!(
+            rendered
+                .text
+                .contains("1. Base Power Company - Software Engineering Intern")
+        );
+        assert!(
+            rendered
+                .text
+                .contains("2. Apple - Software Engineering Masters Internships")
+        );
+        assert!(!rendered.html.contains("<strong>"));
+        assert!(rendered.html.contains("<table>"));
+        assert!(rendered.html.contains("<th>Company</th><th>Role</th>"));
+    }
+
+    #[test]
+    fn render_report_skips_application_list_when_empty() {
+        let report = WeeklyReport {
+            week_start: NaiveDate::from_ymd_opt(2026, 5, 25).unwrap(),
+            week_end: NaiveDate::from_ymd_opt(2026, 5, 31).unwrap(),
+            daily_counts: vec![0, 0, 0, 0, 0, 0, 0],
+            applications: vec![],
+        };
+
+        let rendered = render_weekly_report(&report, Los_Angeles);
+        assert!(rendered.text.contains("You applied to a total of 0 roles"));
+        assert!(!rendered.text.contains("Here's what you applied to"));
+        assert!(!rendered.html.contains("<table>"));
     }
 
     #[test]
