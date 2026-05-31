@@ -216,6 +216,23 @@ cargo run -- inspect emails --limit 10
 cargo run -- inspect email <gmail_message_id>
 ```
 
+## Ingest LeetCode
+
+LeetCode tracking uses the public GraphQL API and only needs your username:
+
+```bash
+export CAREER_TOOLS_LEETCODE_USERNAME='your_leetcode_username'
+cargo run -- leetcode ingest --days 8
+```
+
+Inspect stored accepted submissions:
+
+```bash
+cargo run -- inspect leetcode --limit 20
+```
+
+The weekly pipeline automatically ingests LeetCode when `CAREER_TOOLS_LEETCODE_USERNAME` is set. If it is unset, LeetCode ingest and report content are skipped without failing cron.
+
 ## vLLM / Qwen Setup
 
 Create and configure the vLLM environment:
@@ -313,7 +330,7 @@ cargo run -- inspect applications --limit 20
 
 ## Weekly Email Report
 
-The sent weekly report summarizes the previous completed Monday-Sunday week in `America/Los_Angeles` time. Dry runs preview the rolling 7-day window from 7 days ago through yesterday. Reports count only tracked submission confirmation rows in `job_applications`; rejection and later status emails remain excluded.
+The sent weekly report summarizes the previous completed Monday-Sunday week in `America/Los_Angeles` time. Dry runs preview the rolling 7-day window from 7 days ago through yesterday. Reports count only tracked submission confirmation rows in `job_applications`; rejection and later status emails remain excluded. If `CAREER_TOOLS_LEETCODE_USERNAME` is set, the report also counts unique accepted LeetCode problem solves in the same report window.
 
 Preview the report without sending:
 
@@ -345,10 +362,9 @@ The report includes:
 
 - total applications submitted
 - mean applications per day across all 7 days
-- median applications per day across all 7 days
-- max applications on any day
 - active days count
-- application list with date, company, and role
+- unique LeetCode problems solved, when configured
+- application list with company and role
 
 Report sends are idempotent. A second send for the same week and recipient set is blocked unless you pass `--force`:
 
@@ -416,12 +432,14 @@ Example weekly cron entry for Monday at 9 AM Pacific local time:
 ```cron
 CRON_TZ=America/Los_Angeles
 CAREER_TOOLS_REPORT_TO=kevwjin@gmail.com
+CAREER_TOOLS_REPORT_CC=friend@example.com
+CAREER_TOOLS_LEETCODE_USERNAME=your_leetcode_username
 0 9 * * 1 cd /home/kevwjin/workspace/01-projects/career-tools && scripts/ensure-qwen-vllm.sh && /home/kevwjin/.nix-profile/bin/cargo run -- weekly && /home/kevwjin/.nix-profile/bin/cargo run -- report weekly --send >> /tmp/career-tools-weekly.log 2>&1
 ```
 
-This starts vLLM if needed, pulls the last 8 days of Gmail, processes unhandled messages, then sends the previous completed Monday-Sunday report.
+This starts vLLM if needed, pulls the last 8 days of Gmail and LeetCode activity, processes unhandled messages, then sends the previous completed Monday-Sunday report.
 
-Set `CAREER_TOOLS_REPORT_TO` and optional `CAREER_TOOLS_REPORT_CC` in the crontab or shell environment used by cron.
+Set `CAREER_TOOLS_REPORT_TO`, optional `CAREER_TOOLS_REPORT_CC`, and optional `CAREER_TOOLS_LEETCODE_USERNAME` in the crontab or shell environment used by cron.
 
 ## Current Limitations
 

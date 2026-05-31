@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
@@ -48,6 +49,10 @@ enum Command {
     GmailAuth(GmailAuthArgs),
     Ingest(IngestArgs),
     Process(ProcessArgs),
+    Leetcode {
+        #[command(subcommand)]
+        command: LeetcodeCommand,
+    },
     Daily(DailyArgs),
     Weekly(WeeklyArgs),
     Inspect {
@@ -74,6 +79,23 @@ struct IngestArgs {
 struct GmailAuthArgs {
     #[arg(long)]
     callback_url: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum LeetcodeCommand {
+    Ingest(LeetcodeIngestArgs),
+}
+
+#[derive(Args)]
+struct LeetcodeIngestArgs {
+    #[arg(long, env = "CAREER_TOOLS_LEETCODE_USERNAME")]
+    username: String,
+
+    #[arg(long, default_value_t = 8)]
+    days: u64,
+
+    #[arg(long, default_value_t = 200)]
+    limit: i64,
 }
 
 #[derive(Args)]
@@ -126,6 +148,7 @@ enum InspectCommand {
     Email(InspectEmailArgs),
     Attempts(InspectListArgs),
     Applications(InspectListArgs),
+    Leetcode(InspectListArgs),
 }
 
 #[derive(Subcommand)]
@@ -236,6 +259,27 @@ struct GmailSendResponse {
     id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct LeetcodeGraphqlResponse {
+    data: Option<LeetcodeGraphqlData>,
+    errors: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LeetcodeGraphqlData {
+    #[serde(rename = "recentAcSubmissionList")]
+    recent_ac_submission_list: Vec<LeetcodeSubmission>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LeetcodeSubmission {
+    id: String,
+    title: String,
+    #[serde(rename = "titleSlug")]
+    title_slug: String,
+    timestamp: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct GmailPayload {
     #[serde(rename = "mimeType")]
@@ -280,6 +324,7 @@ struct WeeklyReport {
     week_end: NaiveDate,
     daily_counts: Vec<i64>,
     applications: Vec<WeeklyApplication>,
+    leetcode_problem_count: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -316,6 +361,10 @@ async fn main() -> Result<()> {
             let pool = connect_and_migrate(&cli.database_url).await?;
             process(&pool, args).await
         }
+        Command::Leetcode { command } => {
+            let pool = connect_and_migrate(&cli.database_url).await?;
+            leetcode(&pool, command).await
+        }
         Command::Daily(args) => {
             let pool = connect_and_migrate(&cli.database_url).await?;
             ingest(&pool, &cfg, args.hours).await?;
@@ -334,6 +383,7 @@ async fn main() -> Result<()> {
         Command::Weekly(args) => {
             let pool = connect_and_migrate(&cli.database_url).await?;
             ingest(&pool, &cfg, args.hours).await?;
+            maybe_ingest_leetcode(&pool, args.hours).await?;
             process(
                 &pool,
                 ProcessArgs {
@@ -670,6 +720,124 @@ async fn upsert_message(pool: &PgPool, message: &GmailMessage) -> Result<()> {
     Ok(())
 }
 
+async fn leetcode(pool: &PgPool, command: LeetcodeCommand) -> Result<()> {
+    match command {
+        LeetcodeCommand::Ingest(args) => {
+            ingest_leetcode(pool, &args.username, args.days, args.limit).await
+        }
+    }
+}
+
+async fn maybe_ingest_leetcode(pool: &PgPool, hours: u64) -> Result<()> {
+    let Some(username) = leetcode_username() else {
+        println!("leetcode: skipped; CAREER_TOOLS_LEETCODE_USERNAME is not set");
+        return Ok(());
+    };
+    let days = hours.div_ceil(24).max(1);
+    ingest_leetcode(pool, &username, days, 200).await
+}
+
+fn leetcode_username() -> Option<String> {
+    env::var("CAREER_TOOLS_LEETCODE_USERNAME")
+        .ok()
+        .map(|username| username.trim().to_string())
+        .filter(|username| !username.is_empty())
+}
+
+async fn ingest_leetcode(pool: &PgPool, username: &str, days: u64, limit: i64) -> Result<()> {
+    let submissions = fetch_leetcode_submissions(username, limit).await?;
+    let after = Utc::now() - ChronoDuration::days(days as i64);
+    let mut seen = 0usize;
+    let mut upserted = 0usize;
+
+    for submission in submissions {
+        seen += 1;
+        let submitted_at = parse_leetcode_timestamp(&submission.timestamp)?;
+        if submitted_at < after {
+            continue;
+        }
+        upsert_leetcode_submission(pool, username, &submission, submitted_at).await?;
+        upserted += 1;
+    }
+
+    println!("leetcode ingest complete: saw {seen} accepted submissions, upserted {upserted}");
+    Ok(())
+}
+
+async fn fetch_leetcode_submissions(username: &str, limit: i64) -> Result<Vec<LeetcodeSubmission>> {
+    let request = json!({
+        "query": r#"
+            query recentAcSubmissions($username: String!, $limit: Int!) {
+              recentAcSubmissionList(username: $username, limit: $limit) {
+                id
+                title
+                titleSlug
+                timestamp
+              }
+            }
+        "#,
+        "variables": {
+            "username": username,
+            "limit": limit,
+        }
+    });
+
+    let response: LeetcodeGraphqlResponse = Client::new()
+        .post("https://leetcode.com/graphql/")
+        .json(&request)
+        .send()
+        .await?
+        .pipe(error_for_status_with_body)
+        .await?
+        .json()
+        .await?;
+
+    if let Some(errors) = response.errors {
+        bail!("LeetCode GraphQL returned errors: {errors}");
+    }
+
+    Ok(response
+        .data
+        .map(|data| data.recent_ac_submission_list)
+        .unwrap_or_default())
+}
+
+async fn upsert_leetcode_submission(
+    pool: &PgPool,
+    username: &str,
+    submission: &LeetcodeSubmission,
+    submitted_at: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO leetcode_submissions (
+            username, submission_id, title, title_slug, submitted_at, first_seen_at
+        )
+        VALUES ($1, $2, $3, $4, $5, NOW())
+        ON CONFLICT (submission_id) DO UPDATE SET
+            username = EXCLUDED.username,
+            title = EXCLUDED.title,
+            title_slug = EXCLUDED.title_slug,
+            submitted_at = EXCLUDED.submitted_at
+        "#,
+    )
+    .bind(username)
+    .bind(&submission.id)
+    .bind(&submission.title)
+    .bind(&submission.title_slug)
+    .bind(submitted_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn parse_leetcode_timestamp(value: &str) -> Result<DateTime<Utc>> {
+    let seconds = value.parse::<i64>()?;
+    Utc.timestamp_opt(seconds, 0)
+        .single()
+        .context("invalid LeetCode submission timestamp")
+}
+
 async fn process(pool: &PgPool, args: ProcessArgs) -> Result<()> {
     let query = if args.force {
         r#"
@@ -1003,12 +1171,20 @@ async fn weekly_report(pool: &PgPool, cfg: &AppConfig, args: WeeklyReportArgs) -
     } else {
         "weekly"
     };
-    let (week_start, week_end_exclusive) = if use_rolling_window {
-        rolling_dry_run_window(Utc::now(), Los_Angeles)
-    } else {
-        previous_week_window(Utc::now(), Los_Angeles)?
-    };
-    let report = load_weekly_report(pool, week_start, week_end_exclusive, Los_Angeles).await?;
+    let (week_start, week_end_exclusive) =
+        weekly_report_window(Utc::now(), send, args.rolling, Los_Angeles)?;
+    let leetcode_username = leetcode_username();
+    if leetcode_username.is_none() {
+        println!("leetcode report: skipped; CAREER_TOOLS_LEETCODE_USERNAME is not set");
+    }
+    let report = load_weekly_report(
+        pool,
+        week_start,
+        week_end_exclusive,
+        Los_Angeles,
+        leetcode_username.as_deref(),
+    )
+    .await?;
     let rendered = render_weekly_report(&report, Los_Angeles);
 
     if !send {
@@ -1063,6 +1239,7 @@ async fn load_weekly_report(
     week_start: NaiveDate,
     week_end_exclusive: NaiveDate,
     tz: Tz,
+    leetcode_username: Option<&str>,
 ) -> Result<WeeklyReport> {
     let start_utc = local_midnight(tz, week_start)?.with_timezone(&Utc);
     let end_utc = local_midnight(tz, week_end_exclusive)?.with_timezone(&Utc);
@@ -1094,12 +1271,42 @@ async fn load_weekly_report(
     }
 
     let daily_counts = daily_counts(week_start, &applications, tz);
+    let leetcode_problem_count = match leetcode_username {
+        Some(username) => {
+            Some(count_unique_leetcode_solves(pool, username, start_utc, end_utc).await?)
+        }
+        None => None,
+    };
     Ok(WeeklyReport {
         week_start,
         week_end: week_end_exclusive - ChronoDuration::days(1),
         daily_counts,
         applications,
+        leetcode_problem_count,
     })
+}
+
+async fn count_unique_leetcode_solves(
+    pool: &PgPool,
+    username: &str,
+    start_utc: DateTime<Utc>,
+    end_utc: DateTime<Utc>,
+) -> Result<i64> {
+    let count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(DISTINCT title_slug)
+        FROM leetcode_submissions
+        WHERE username = $1
+          AND submitted_at >= $2
+          AND submitted_at < $3
+        "#,
+    )
+    .bind(username)
+    .bind(start_utc)
+    .bind(end_utc)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
 }
 
 fn render_weekly_report(report: &WeeklyReport, _tz: Tz) -> RenderedReport {
@@ -1123,6 +1330,11 @@ fn render_weekly_report(report: &WeeklyReport, _tz: Tz) -> RenderedReport {
         "You applied to a total of {total} roles, averaging {:.2} per day. You applied to roles {active_days} out of the 7 days last week.\n",
         mean
     ));
+    if let Some(count) = report.leetcode_problem_count {
+        text.push_str(&format!(
+            "You solved {count} LeetCode problems this week.\n"
+        ));
+    }
     if !report.applications.is_empty() {
         text.push_str("\nHere's what you applied to:\n\n");
         for (idx, app) in report.applications.iter().enumerate() {
@@ -1139,6 +1351,11 @@ fn render_weekly_report(report: &WeeklyReport, _tz: Tz) -> RenderedReport {
         "<p>You applied to a <strong>total of {total} roles</strong>, averaging {:.2} per day. You applied to roles <strong>{active_days} out of the 7</strong> days last week.</p>",
         mean
     ));
+    if let Some(count) = report.leetcode_problem_count {
+        html.push_str(&format!(
+            "<p>You solved <strong>{count} LeetCode problems</strong> this week.</p>"
+        ));
+    }
     if !report.applications.is_empty() {
         html.push_str("<p>Here's what you applied to:</p>");
         html.push_str("<table style=\"border-collapse: collapse; width: 100%;\"><thead><tr><th style=\"border: 1px solid #cccccc; padding: 6px; text-align: left;\">Company</th><th style=\"border: 1px solid #cccccc; padding: 6px; text-align: left;\">Role</th></tr></thead><tbody>");
@@ -1176,6 +1393,19 @@ fn rolling_dry_run_window(now_utc: DateTime<Utc>, tz: Tz) -> (NaiveDate, NaiveDa
     let end_exclusive = local_today;
     let start = end_exclusive - ChronoDuration::days(7);
     (start, end_exclusive)
+}
+
+fn weekly_report_window(
+    now_utc: DateTime<Utc>,
+    send: bool,
+    rolling: bool,
+    tz: Tz,
+) -> Result<(NaiveDate, NaiveDate)> {
+    if rolling || !send {
+        Ok(rolling_dry_run_window(now_utc, tz))
+    } else {
+        previous_week_window(now_utc, tz)
+    }
 }
 
 fn local_midnight(tz: Tz, date: NaiveDate) -> Result<DateTime<Tz>> {
@@ -1336,6 +1566,7 @@ async fn inspect(pool: &PgPool, command: InspectCommand) -> Result<()> {
         InspectCommand::Email(args) => inspect_email(pool, &args.gmail_message_id).await,
         InspectCommand::Attempts(args) => inspect_attempts(pool, args.limit).await,
         InspectCommand::Applications(args) => inspect_applications(pool, args.limit).await,
+        InspectCommand::Leetcode(args) => inspect_leetcode(pool, args.limit).await,
     }
 }
 
@@ -1457,6 +1688,32 @@ async fn inspect_applications(pool: &PgPool, limit: i64) -> Result<()> {
             row.get::<Option<String>, _>("job_posting_url"),
             row.get::<f64, _>("confidence"),
             row.get::<String, _>("source_gmail_message_id")
+        );
+    }
+    Ok(())
+}
+
+async fn inspect_leetcode(pool: &PgPool, limit: i64) -> Result<()> {
+    let rows = sqlx::query(
+        r#"
+        SELECT username, title, title_slug, submission_id, submitted_at
+        FROM leetcode_submissions
+        ORDER BY submitted_at DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    for row in rows {
+        println!(
+            "{} | {} | {} | {} | {}",
+            row.get::<DateTime<Utc>, _>("submitted_at").to_rfc3339(),
+            row.get::<String, _>("username"),
+            row.get::<String, _>("title"),
+            row.get::<String, _>("title_slug"),
+            row.get::<String, _>("submission_id")
         );
     }
     Ok(())
@@ -1693,6 +1950,20 @@ impl<T> Pipe for T {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    fn unique_leetcode_solves_for_window(
+        submissions: &[(String, DateTime<Utc>)],
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> usize {
+        submissions
+            .iter()
+            .filter(|(_, submitted_at)| *submitted_at >= start && *submitted_at < end)
+            .map(|(title_slug, _)| title_slug)
+            .collect::<HashSet<_>>()
+            .len()
+    }
 
     #[test]
     fn application_key_distinguishes_roles_at_same_company() {
@@ -1763,6 +2034,58 @@ mod tests {
     }
 
     #[test]
+    fn weekly_report_window_uses_rolling_for_dry_run_and_completed_week_for_send() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 3, 16, 0, 0).single().unwrap();
+        let (dry_start, dry_end) = weekly_report_window(now, false, false, Los_Angeles).unwrap();
+        let (send_start, send_end) = weekly_report_window(now, true, false, Los_Angeles).unwrap();
+
+        assert_eq!(dry_start, NaiveDate::from_ymd_opt(2026, 5, 27).unwrap());
+        assert_eq!(dry_end, NaiveDate::from_ymd_opt(2026, 6, 3).unwrap());
+        assert_eq!(send_start, NaiveDate::from_ymd_opt(2026, 5, 25).unwrap());
+        assert_eq!(send_end, NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
+    }
+
+    #[test]
+    fn unique_leetcode_solves_dedupe_within_window() {
+        let start = Utc.with_ymd_and_hms(2026, 5, 25, 7, 0, 0).single().unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 6, 1, 7, 0, 0).single().unwrap();
+        let submissions = vec![
+            ("two-sum".to_string(), start + ChronoDuration::hours(1)),
+            ("two-sum".to_string(), start + ChronoDuration::hours(2)),
+            (
+                "add-two-numbers".to_string(),
+                start + ChronoDuration::days(2),
+            ),
+            (
+                "outside-before".to_string(),
+                start - ChronoDuration::seconds(1),
+            ),
+            ("outside-after".to_string(), end),
+        ];
+
+        assert_eq!(
+            unique_leetcode_solves_for_window(&submissions, start, end),
+            2
+        );
+    }
+
+    #[test]
+    fn repeated_old_leetcode_solve_counts_once_when_solved_in_window() {
+        let start = Utc.with_ymd_and_hms(2026, 5, 25, 7, 0, 0).single().unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 6, 1, 7, 0, 0).single().unwrap();
+        let submissions = vec![
+            ("two-sum".to_string(), start - ChronoDuration::days(30)),
+            ("two-sum".to_string(), start + ChronoDuration::hours(1)),
+            ("two-sum".to_string(), start + ChronoDuration::hours(2)),
+        ];
+
+        assert_eq!(
+            unique_leetcode_solves_for_window(&submissions, start, end),
+            1
+        );
+    }
+
+    #[test]
     fn computes_daily_counts_and_summary_stats() {
         let week_start = NaiveDate::from_ymd_opt(2026, 5, 25).unwrap();
         let applications = vec![
@@ -1828,6 +2151,7 @@ mod tests {
                     role: "Software Engineering Masters Internships".to_string(),
                 },
             ],
+            leetcode_problem_count: Some(3),
         };
 
         let rendered = render_weekly_report(&report, Los_Angeles);
@@ -1840,6 +2164,11 @@ mod tests {
         assert!(
             rendered
                 .text
+                .contains("You solved 3 LeetCode problems this week.")
+        );
+        assert!(
+            rendered
+                .text
                 .contains("1. Base Power Company - Software Engineering Intern")
         );
         assert!(
@@ -1849,6 +2178,11 @@ mod tests {
         );
         assert!(rendered.html.contains("<strong>total of 2 roles</strong>"));
         assert!(rendered.html.contains("<strong>2 out of the 7</strong>"));
+        assert!(
+            rendered
+                .html
+                .contains("<strong>3 LeetCode problems</strong>")
+        );
         assert!(rendered.html.contains("<table style="));
         assert!(rendered.html.contains("text-align: left;\">Company</th>"));
         assert!(rendered.html.contains("border: 1px solid #cccccc"));
@@ -1861,6 +2195,7 @@ mod tests {
             week_end: NaiveDate::from_ymd_opt(2026, 5, 31).unwrap(),
             daily_counts: vec![0, 0, 0, 0, 0, 0, 0],
             applications: vec![],
+            leetcode_problem_count: None,
         };
 
         let rendered = render_weekly_report(&report, Los_Angeles);
