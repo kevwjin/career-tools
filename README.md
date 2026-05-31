@@ -247,6 +247,14 @@ Start Qwen:
 scripts/serve-qwen-vllm.sh
 ```
 
+Start Qwen only when it is not already healthy, and wait for readiness:
+
+```bash
+scripts/ensure-qwen-vllm.sh
+```
+
+The ensure script writes vLLM logs to `/tmp/career-tools-vllm.log` and stores the background PID at `/tmp/career-tools-vllm.pid`.
+
 The launch script uses a conservative 8 GB VRAM profile:
 
 - disables FlashInfer sampler because this machine does not have `nvcc` available
@@ -400,11 +408,10 @@ Example weekly cron entry for Monday at 9 AM Pacific local time:
 ```cron
 CRON_TZ=America/Los_Angeles
 CAREER_TOOLS_REPORT_TO=kevwjin@gmail.com
-CAREER_TOOLS_REPORT_CC=friend@example.com
-0 9 * * 1 cd /home/kevwjin/workspace/01-projects/career-tools && /home/kevwjin/.cargo/bin/cargo run -- weekly && /home/kevwjin/.cargo/bin/cargo run -- report weekly --send >> /tmp/career-tools-weekly.log 2>&1
+0 9 * * 1 cd /home/kevwjin/workspace/01-projects/career-tools && scripts/ensure-qwen-vllm.sh && /home/kevwjin/.nix-profile/bin/cargo run -- weekly && /home/kevwjin/.nix-profile/bin/cargo run -- report weekly --send >> /tmp/career-tools-weekly.log 2>&1
 ```
 
-This pulls the last 8 days of Gmail, processes unhandled messages, then sends the previous completed Monday-Sunday report. Run vLLM separately before the cron job, or manage `scripts/serve-qwen-vllm.sh` with your preferred process manager.
+This starts vLLM if needed, pulls the last 8 days of Gmail, processes unhandled messages, then sends the previous completed Monday-Sunday report.
 
 Set `CAREER_TOOLS_REPORT_TO` and optional `CAREER_TOOLS_REPORT_CC` in the crontab or shell environment used by cron.
 
