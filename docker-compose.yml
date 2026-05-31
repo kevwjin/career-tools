@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: career-tools-postgres
+    environment:
+      POSTGRES_USER: career_tools
+      POSTGRES_PASSWORD: career_tools
+      POSTGRES_DB: career_tools
+    ports:
+      - "5432:5432"
+    volumes:
+      - career-tools-postgres:/var/lib/postgresql/data
+
+volumes:
+  career-tools-postgres:
