@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
+use chrono_tz::America::Los_Angeles;
+use chrono_tz::Tz;
 use clap::{Args, Parser, Subcommand};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -17,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use url::Url;
 
-const GMAIL_READONLY_SCOPE: &str = "https://www.googleapis.com/auth/gmail.readonly";
+const GMAIL_SCOPES: &str = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send";
 const PROMPT_VERSION: &str = "applied-v1";
 
 #[derive(Parser)]
@@ -44,6 +46,10 @@ enum Command {
     Inspect {
         #[command(subcommand)]
         command: InspectCommand,
+    },
+    Report {
+        #[command(subcommand)]
+        command: ReportCommand,
     },
     Db {
         #[command(subcommand)]
@@ -93,6 +99,29 @@ enum InspectCommand {
     Email(InspectEmailArgs),
     Attempts(InspectListArgs),
     Applications(InspectListArgs),
+}
+
+#[derive(Subcommand)]
+enum ReportCommand {
+    Weekly(WeeklyReportArgs),
+}
+
+#[derive(Args)]
+struct WeeklyReportArgs {
+    #[arg(long, env = "CAREER_TOOLS_REPORT_TO")]
+    to: Option<String>,
+
+    #[arg(long, env = "CAREER_TOOLS_REPORT_CC")]
+    cc: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+
+    #[arg(long, default_value_t = false)]
+    send: bool,
+
+    #[arg(long, default_value_t = false)]
+    force: bool,
 }
 
 #[derive(Args)]
@@ -172,6 +201,11 @@ struct GmailMessage {
     size_estimate: Option<i32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct GmailSendResponse {
+    id: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct GmailPayload {
     #[serde(rename = "mimeType")]
@@ -201,6 +235,29 @@ struct AppliedExtraction {
     job_posting_url: Option<String>,
     confidence: f64,
     reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WeeklyApplication {
+    submitted_at: DateTime<Utc>,
+    company: String,
+    role: String,
+}
+
+#[derive(Debug)]
+struct WeeklyReport {
+    week_start: NaiveDate,
+    week_end: NaiveDate,
+    daily_counts: Vec<i64>,
+    applications: Vec<WeeklyApplication>,
+}
+
+#[derive(Debug)]
+struct RenderedReport {
+    subject: String,
+    text: String,
+    html: String,
+    content_hash: String,
 }
 
 #[tokio::main]
@@ -237,6 +294,10 @@ async fn main() -> Result<()> {
         Command::Inspect { command } => {
             let pool = connect_and_migrate(&cli.database_url).await?;
             inspect(&pool, command).await
+        }
+        Command::Report { command } => {
+            let pool = connect_and_migrate(&cli.database_url).await?;
+            report(&pool, &cfg, command).await
         }
         Command::Db {
             command: DbCommand::Migrate,
@@ -302,7 +363,7 @@ async fn preflight(database_url: &str, cfg: &AppConfig) -> Result<()> {
     let client = Client::new();
     match client
         .get("http://127.0.0.1:8000/v1/models")
-        .timeout(Duration::from_secs(2))
+        .timeout(StdDuration::from_secs(2))
         .send()
         .await
     {
@@ -342,7 +403,7 @@ async fn gmail_auth(cfg: &AppConfig, args: GmailAuthArgs) -> Result<()> {
         .append_pair("client_id", &oauth.client_id)
         .append_pair("redirect_uri", &redirect_uri)
         .append_pair("response_type", "code")
-        .append_pair("scope", GMAIL_READONLY_SCOPE)
+        .append_pair("scope", GMAIL_SCOPES)
         .append_pair("access_type", "offline")
         .append_pair("prompt", "consent");
 
@@ -439,7 +500,7 @@ async fn ingest(pool: &PgPool, cfg: &AppConfig, hours: u64) -> Result<()> {
     let token = access_token(cfg, &oauth).await?;
     let client = Client::new();
     let after_epoch = SystemTime::now()
-        .checked_sub(Duration::from_secs(hours * 60 * 60))
+        .checked_sub(StdDuration::from_secs(hours * 60 * 60))
         .context("invalid ingest window")?
         .duration_since(UNIX_EPOCH)?
         .as_secs();
@@ -822,6 +883,345 @@ async fn upsert_application(pool: &PgPool, gmail_message_id: &str, gmail_thread_
     Ok(())
 }
 
+async fn report(pool: &PgPool, cfg: &AppConfig, command: ReportCommand) -> Result<()> {
+    match command {
+        ReportCommand::Weekly(args) => weekly_report(pool, cfg, args).await,
+    }
+}
+
+async fn weekly_report(pool: &PgPool, cfg: &AppConfig, args: WeeklyReportArgs) -> Result<()> {
+    if args.dry_run && args.send {
+        bail!("use either --dry-run or --send, not both");
+    }
+
+    let to_addrs = parse_recipient_list(args.to.as_deref());
+    let cc_addrs = parse_recipient_list(args.cc.as_deref());
+    let send = args.send;
+    if send && to_addrs.is_empty() {
+        bail!("--send requires at least one --to recipient or CAREER_TOOLS_REPORT_TO");
+    }
+
+    let (week_start, week_end_exclusive) = previous_week_window(Utc::now(), Los_Angeles)?;
+    let report = load_weekly_report(pool, week_start, week_end_exclusive, Los_Angeles).await?;
+    let rendered = render_weekly_report(&report, Los_Angeles);
+
+    if !send {
+        println!("{}", rendered.text);
+        return Ok(());
+    }
+
+    let week_end = week_end_exclusive - ChronoDuration::days(1);
+    if !args.force && report_send_exists(pool, "weekly", week_start, &to_addrs, &cc_addrs).await? {
+        bail!(
+            "weekly report for {} was already sent to {}; rerun with --force to resend",
+            week_start,
+            to_addrs.join(", ")
+        );
+    }
+
+    let oauth = read_oauth_client(cfg)?;
+    let token = access_token(cfg, &oauth).await?;
+    let mime = build_mime_message(&to_addrs, &cc_addrs, &rendered.subject, &rendered.text, &rendered.html);
+    let gmail_id = send_gmail_message(&token, &mime).await?;
+    record_report_send(
+        pool,
+        "weekly",
+        week_start,
+        week_end,
+        &to_addrs,
+        &cc_addrs,
+        &rendered.content_hash,
+        gmail_id.as_deref(),
+    )
+    .await?;
+    println!("sent weekly report for {} to {}", week_start, to_addrs.join(", "));
+    Ok(())
+}
+
+async fn load_weekly_report(
+    pool: &PgPool,
+    week_start: NaiveDate,
+    week_end_exclusive: NaiveDate,
+    tz: Tz,
+) -> Result<WeeklyReport> {
+    let start_utc = local_midnight(tz, week_start)?.with_timezone(&Utc);
+    let end_utc = local_midnight(tz, week_end_exclusive)?.with_timezone(&Utc);
+    let rows = sqlx::query(
+        r#"
+        SELECT ja.company, ja.role, gm.internal_date
+        FROM job_applications ja
+        JOIN gmail_messages gm ON gm.gmail_message_id = ja.source_gmail_message_id
+        WHERE gm.internal_date >= $1
+          AND gm.internal_date < $2
+        ORDER BY gm.internal_date ASC, ja.company ASC, ja.role ASC
+        "#,
+    )
+    .bind(start_utc)
+    .bind(end_utc)
+    .fetch_all(pool)
+    .await?;
+
+    let mut applications = Vec::new();
+    for row in rows {
+        let submitted_at: Option<DateTime<Utc>> = row.get("internal_date");
+        if let Some(submitted_at) = submitted_at {
+            applications.push(WeeklyApplication {
+                submitted_at,
+                company: row.get("company"),
+                role: row.get("role"),
+            });
+        }
+    }
+
+    let daily_counts = daily_counts(week_start, &applications, tz);
+    Ok(WeeklyReport {
+        week_start,
+        week_end: week_end_exclusive - ChronoDuration::days(1),
+        daily_counts,
+        applications,
+    })
+}
+
+fn render_weekly_report(report: &WeeklyReport, tz: Tz) -> RenderedReport {
+    let total: i64 = report.daily_counts.iter().sum();
+    let mean = mean(&report.daily_counts);
+    let median = median(&report.daily_counts);
+    let max = report.daily_counts.iter().copied().max().unwrap_or(0);
+    let active_days = report.daily_counts.iter().filter(|count| **count > 0).count();
+    let subject = format!(
+        "Career tools weekly report: {}-{}",
+        report.week_start.format("%b %-d"),
+        report.week_end.format("%b %-d, %Y")
+    );
+
+    let mut text = String::new();
+    text.push_str(&format!("{}\n\n", subject));
+    text.push_str(&format!("Total applications: {total}\n"));
+    text.push_str(&format!("Mean per day: {:.2}\n", mean));
+    text.push_str(&format!("Median per day: {:.2}\n", median));
+    text.push_str(&format!("Max in a day: {max}\n"));
+    text.push_str(&format!("Active days: {active_days}/7\n\n"));
+    text.push_str("Applications:\n");
+    if report.applications.is_empty() {
+        text.push_str("- None\n");
+    } else {
+        for app in &report.applications {
+            text.push_str(&format!(
+                "- {}: {} - {}\n",
+                app.submitted_at.with_timezone(&tz).date_naive(),
+                app.company,
+                app.role
+            ));
+        }
+    }
+
+    let mut html = String::new();
+    html.push_str("<!doctype html><html><body>");
+    html.push_str(&format!("<h1>{}</h1>", html_escape(&subject)));
+    html.push_str("<ul>");
+    html.push_str(&format!("<li><strong>Total applications:</strong> {total}</li>"));
+    html.push_str(&format!("<li><strong>Mean per day:</strong> {:.2}</li>", mean));
+    html.push_str(&format!("<li><strong>Median per day:</strong> {:.2}</li>", median));
+    html.push_str(&format!("<li><strong>Max in a day:</strong> {max}</li>"));
+    html.push_str(&format!("<li><strong>Active days:</strong> {active_days}/7</li>"));
+    html.push_str("</ul>");
+    html.push_str("<h2>Applications</h2>");
+    if report.applications.is_empty() {
+        html.push_str("<p>None</p>");
+    } else {
+        html.push_str("<table><thead><tr><th>Date</th><th>Company</th><th>Role</th></tr></thead><tbody>");
+        for app in &report.applications {
+            html.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                app.submitted_at.with_timezone(&tz).date_naive(),
+                html_escape(&app.company),
+                html_escape(&app.role)
+            ));
+        }
+        html.push_str("</tbody></table>");
+    }
+    html.push_str("</body></html>");
+
+    let content_hash = hash_text(&format!("{subject}\n{text}\n{html}"));
+    RenderedReport {
+        subject,
+        text,
+        html,
+        content_hash,
+    }
+}
+
+fn previous_week_window(now_utc: DateTime<Utc>, tz: Tz) -> Result<(NaiveDate, NaiveDate)> {
+    let local_today = now_utc.with_timezone(&tz).date_naive();
+    let days_since_monday = local_today.weekday().num_days_from_monday() as i64;
+    let current_week_start = local_today - ChronoDuration::days(days_since_monday);
+    let previous_week_start = current_week_start - ChronoDuration::days(7);
+    Ok((previous_week_start, current_week_start))
+}
+
+fn local_midnight(tz: Tz, date: NaiveDate) -> Result<DateTime<Tz>> {
+    tz.with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
+        .single()
+        .with_context(|| format!("could not resolve local midnight for {date}"))
+}
+
+fn daily_counts(week_start: NaiveDate, applications: &[WeeklyApplication], tz: Tz) -> Vec<i64> {
+    let mut counts = vec![0; 7];
+    for app in applications {
+        let local_date = app.submitted_at.with_timezone(&tz).date_naive();
+        let offset = (local_date - week_start).num_days();
+        if (0..7).contains(&offset) {
+            counts[offset as usize] += 1;
+        }
+    }
+    counts
+}
+
+fn mean(values: &[i64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().sum::<i64>() as f64 / values.len() as f64
+}
+
+fn median(values: &[i64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        (sorted[mid - 1] + sorted[mid]) as f64 / 2.0
+    } else {
+        sorted[mid] as f64
+    }
+}
+
+fn parse_recipient_list(value: Option<&str>) -> Vec<String> {
+    let mut recipients = value
+        .unwrap_or("")
+        .split(',')
+        .map(|recipient| recipient.trim().to_lowercase())
+        .filter(|recipient| !recipient.is_empty())
+        .collect::<Vec<_>>();
+    recipients.sort();
+    recipients.dedup();
+    recipients
+}
+
+fn build_mime_message(to_addrs: &[String], cc_addrs: &[String], subject: &str, text: &str, html: &str) -> String {
+    let boundary = format!("career-tools-{}", hash_text(subject).chars().take(16).collect::<String>());
+    let mut message = String::new();
+    message.push_str(&format!("To: {}\r\n", to_addrs.join(", ")));
+    if !cc_addrs.is_empty() {
+        message.push_str(&format!("Cc: {}\r\n", cc_addrs.join(", ")));
+    }
+    message.push_str(&format!("Subject: {}\r\n", subject));
+    message.push_str("MIME-Version: 1.0\r\n");
+    message.push_str(&format!("Content-Type: multipart/alternative; boundary=\"{}\"\r\n", boundary));
+    message.push_str("\r\n");
+    message.push_str(&format!("--{}\r\n", boundary));
+    message.push_str("Content-Type: text/plain; charset=\"UTF-8\"\r\n");
+    message.push_str("Content-Transfer-Encoding: 8bit\r\n\r\n");
+    message.push_str(text);
+    message.push_str("\r\n");
+    message.push_str(&format!("--{}\r\n", boundary));
+    message.push_str("Content-Type: text/html; charset=\"UTF-8\"\r\n");
+    message.push_str("Content-Transfer-Encoding: 8bit\r\n\r\n");
+    message.push_str(html);
+    message.push_str("\r\n");
+    message.push_str(&format!("--{}--\r\n", boundary));
+    message
+}
+
+async fn send_gmail_message(token: &str, mime: &str) -> Result<Option<String>> {
+    let raw = URL_SAFE_NO_PAD.encode(mime.as_bytes());
+    let response: GmailSendResponse = Client::new()
+        .post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
+        .bearer_auth(token)
+        .json(&json!({ "raw": raw }))
+        .send()
+        .await?
+        .pipe(error_for_status_with_body)
+        .await?
+        .json()
+        .await?;
+    Ok(response.id)
+}
+
+async fn report_send_exists(
+    pool: &PgPool,
+    report_type: &str,
+    week_start: NaiveDate,
+    to_addrs: &[String],
+    cc_addrs: &[String],
+) -> Result<bool> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM report_sends
+            WHERE report_type = $1
+              AND week_start = $2
+              AND to_addrs = $3
+              AND cc_addrs = $4
+        )
+        "#,
+    )
+    .bind(report_type)
+    .bind(week_start)
+    .bind(to_addrs)
+    .bind(cc_addrs)
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
+}
+
+async fn record_report_send(
+    pool: &PgPool,
+    report_type: &str,
+    week_start: NaiveDate,
+    week_end: NaiveDate,
+    to_addrs: &[String],
+    cc_addrs: &[String],
+    content_hash: &str,
+    gmail_message_id: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO report_sends (
+            report_type, week_start, week_end, to_addrs, cc_addrs,
+            content_hash, gmail_message_id, sent_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+        ON CONFLICT (report_type, week_start, to_addrs, cc_addrs) DO UPDATE SET
+            week_end = EXCLUDED.week_end,
+            content_hash = EXCLUDED.content_hash,
+            gmail_message_id = EXCLUDED.gmail_message_id,
+            sent_at = NOW()
+        "#,
+    )
+    .bind(report_type)
+    .bind(week_start)
+    .bind(week_end)
+    .bind(to_addrs)
+    .bind(cc_addrs)
+    .bind(content_hash)
+    .bind(gmail_message_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 async fn inspect(pool: &PgPool, command: InspectCommand) -> Result<()> {
     match command {
         InspectCommand::Emails(args) => inspect_emails(pool, args.limit).await,
@@ -1199,5 +1599,112 @@ mod tests {
             Some("We would like to inform you that we will not be moving forward"),
             None,
         ));
+    }
+
+    #[test]
+    fn previous_week_window_uses_pacific_calendar_week() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 1, 16, 0, 0).single().unwrap();
+        let (start, end_exclusive) = previous_week_window(now, Los_Angeles).unwrap();
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 5, 25).unwrap());
+        assert_eq!(end_exclusive, NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
+    }
+
+    #[test]
+    fn computes_daily_counts_and_summary_stats() {
+        let week_start = NaiveDate::from_ymd_opt(2026, 5, 25).unwrap();
+        let applications = vec![
+            WeeklyApplication {
+                submitted_at: Los_Angeles
+                    .with_ymd_and_hms(2026, 5, 25, 9, 0, 0)
+                    .single()
+                    .unwrap()
+                    .with_timezone(&Utc),
+                company: "A".to_string(),
+                role: "One".to_string(),
+            },
+            WeeklyApplication {
+                submitted_at: Los_Angeles
+                    .with_ymd_and_hms(2026, 5, 25, 10, 0, 0)
+                    .single()
+                    .unwrap()
+                    .with_timezone(&Utc),
+                company: "B".to_string(),
+                role: "Two".to_string(),
+            },
+            WeeklyApplication {
+                submitted_at: Los_Angeles
+                    .with_ymd_and_hms(2026, 5, 27, 10, 0, 0)
+                    .single()
+                    .unwrap()
+                    .with_timezone(&Utc),
+                company: "C".to_string(),
+                role: "Three".to_string(),
+            },
+        ];
+
+        let counts = daily_counts(week_start, &applications, Los_Angeles);
+        assert_eq!(counts, vec![2, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(mean(&counts), 3.0 / 7.0);
+        assert_eq!(median(&counts), 0.0);
+        assert_eq!(counts.iter().copied().max().unwrap(), 2);
+        assert_eq!(counts.iter().filter(|count| **count > 0).count(), 2);
+    }
+
+    #[test]
+    fn render_report_preserves_application_order() {
+        let report = WeeklyReport {
+            week_start: NaiveDate::from_ymd_opt(2026, 5, 25).unwrap(),
+            week_end: NaiveDate::from_ymd_opt(2026, 5, 31).unwrap(),
+            daily_counts: vec![0, 1, 0, 1, 0, 0, 0],
+            applications: vec![
+                WeeklyApplication {
+                    submitted_at: Los_Angeles
+                        .with_ymd_and_hms(2026, 5, 26, 9, 0, 0)
+                        .single()
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    company: "Base Power Company".to_string(),
+                    role: "Software Engineering Intern".to_string(),
+                },
+                WeeklyApplication {
+                    submitted_at: Los_Angeles
+                        .with_ymd_and_hms(2026, 5, 28, 9, 0, 0)
+                        .single()
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    company: "Apple".to_string(),
+                    role: "Software Engineering Masters Internships".to_string(),
+                },
+            ],
+        };
+
+        let rendered = render_weekly_report(&report, Los_Angeles);
+        let base_idx = rendered.text.find("Base Power Company").unwrap();
+        let apple_idx = rendered.text.find("Apple").unwrap();
+        assert!(base_idx < apple_idx);
+        assert!(rendered.text.contains("Total applications: 2"));
+        assert!(rendered.text.contains("Active days: 2/7"));
+    }
+
+    #[test]
+    fn normalizes_recipients_for_duplicate_detection() {
+        let recipients = parse_recipient_list(Some("Friend@Example.com, me@example.com, friend@example.com"));
+        assert_eq!(recipients, vec!["friend@example.com", "me@example.com"]);
+    }
+
+    #[test]
+    fn mime_message_contains_recipients_subject_and_parts() {
+        let mime = build_mime_message(
+            &["me@example.com".to_string()],
+            &["friend@example.com".to_string()],
+            "Weekly Report",
+            "plain text",
+            "<p>html</p>",
+        );
+        assert!(mime.contains("To: me@example.com\r\n"));
+        assert!(mime.contains("Cc: friend@example.com\r\n"));
+        assert!(mime.contains("Subject: Weekly Report\r\n"));
+        assert!(mime.contains("Content-Type: text/plain; charset=\"UTF-8\""));
+        assert!(mime.contains("Content-Type: text/html; charset=\"UTF-8\""));
     }
 }

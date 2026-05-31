@@ -4,7 +4,7 @@ Local job application tracker that reads Gmail, asks a local Qwen model to ident
 
 This is intentionally local-first:
 
-- Gmail access uses the Gmail API with read-only OAuth.
+- Gmail access uses the Gmail API with OAuth.
 - LLM inference runs locally through vLLM.
 - The model is `Qwen/Qwen3-8B-AWQ`.
 - Postgres is the source of truth.
@@ -63,10 +63,11 @@ nvidia-smi
 4. Configure Google Auth Platform / OAuth consent:
    - App can stay in testing mode.
    - Add your Gmail account as a test user.
-   - Use read-only Gmail scope:
+   - Use Gmail read and send scopes:
 
 ```text
 https://www.googleapis.com/auth/gmail.readonly
+https://www.googleapis.com/auth/gmail.send
 ```
 
 5. Create an OAuth client:
@@ -158,6 +159,8 @@ The token is stored outside the repo:
 ```text
 ~/.config/career-tools/google-token.json
 ```
+
+If you previously authenticated before weekly email reports existed, rerun `gmail-auth` once. The report sender needs the additional `gmail.send` scope.
 
 ## Ingest Gmail
 
@@ -275,6 +278,45 @@ Inspect tracked applications:
 cargo run -- inspect applications --limit 20
 ```
 
+## Weekly Email Report
+
+The weekly report summarizes the previous completed Monday-Sunday week in `America/Los_Angeles` time. It counts only tracked submission confirmation rows in `job_applications`; rejection and later status emails remain excluded.
+
+Preview the report without sending:
+
+```bash
+cargo run -- report weekly --dry-run
+```
+
+Send it through Gmail:
+
+```bash
+cargo run -- report weekly --send --to kevwjin@gmail.com --cc friend@example.com
+```
+
+Recipients can also come from environment variables:
+
+```bash
+export CAREER_TOOLS_REPORT_TO='kevwjin@gmail.com'
+export CAREER_TOOLS_REPORT_CC='friend@example.com'
+cargo run -- report weekly --send
+```
+
+The report includes:
+
+- total applications submitted
+- mean applications per day across all 7 days
+- median applications per day across all 7 days
+- max applications on any day
+- active days count
+- application list with date, company, and role
+
+Report sends are idempotent. A second send for the same week and recipient set is blocked unless you pass `--force`:
+
+```bash
+cargo run -- report weekly --send --force
+```
+
 ## Decisions
 
 Extraction attempts use these decisions:
@@ -338,6 +380,15 @@ Example daily cron entry:
 
 Run vLLM separately before the cron job, or manage `scripts/serve-qwen-vllm.sh` with your preferred process manager.
 
+Example weekly report cron entry for Monday at 9 AM Pacific local time:
+
+```cron
+CRON_TZ=America/Los_Angeles
+0 9 * * 1 cd /home/kevwjin/workspace/01-projects/career-tools && /home/kevwjin/.cargo/bin/cargo run -- report weekly --send >> /tmp/career-tools-weekly.log 2>&1
+```
+
+Set `CAREER_TOOLS_REPORT_TO` and optional `CAREER_TOOLS_REPORT_CC` in the crontab or shell environment used by cron.
+
 ## Current Limitations
 
 - Qwen/vLLM must already be running before `process` or `daily`.
@@ -389,4 +440,3 @@ Start the container:
 ```bash
 docker compose up -d
 ```
-
