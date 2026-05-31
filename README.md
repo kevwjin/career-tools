@@ -325,6 +325,12 @@ Send it through Gmail:
 cargo run -- report weekly --send --to kevwjin@gmail.com --cc friend@example.com
 ```
 
+Send the rolling dry-run window manually:
+
+```bash
+cargo run -- report weekly --send --rolling --to kevwjin@gmail.com
+```
+
 Recipients can also come from environment variables:
 
 ```bash

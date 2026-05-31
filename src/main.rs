@@ -149,6 +149,9 @@ struct WeeklyReportArgs {
 
     #[arg(long, default_value_t = false)]
     force: bool,
+
+    #[arg(long, default_value_t = false)]
+    rolling: bool,
 }
 
 #[derive(Args)]
@@ -994,10 +997,16 @@ async fn weekly_report(pool: &PgPool, cfg: &AppConfig, args: WeeklyReportArgs) -
         bail!("--send requires at least one --to recipient or CAREER_TOOLS_REPORT_TO");
     }
 
-    let (week_start, week_end_exclusive) = if send {
-        previous_week_window(Utc::now(), Los_Angeles)?
+    let use_rolling_window = args.rolling || !send;
+    let report_type = if use_rolling_window {
+        "weekly_rolling"
     } else {
+        "weekly"
+    };
+    let (week_start, week_end_exclusive) = if use_rolling_window {
         rolling_dry_run_window(Utc::now(), Los_Angeles)
+    } else {
+        previous_week_window(Utc::now(), Los_Angeles)?
     };
     let report = load_weekly_report(pool, week_start, week_end_exclusive, Los_Angeles).await?;
     let rendered = render_weekly_report(&report, Los_Angeles);
@@ -1008,7 +1017,9 @@ async fn weekly_report(pool: &PgPool, cfg: &AppConfig, args: WeeklyReportArgs) -
     }
 
     let week_end = week_end_exclusive - ChronoDuration::days(1);
-    if !args.force && report_send_exists(pool, "weekly", week_start, &to_addrs, &cc_addrs).await? {
+    if !args.force
+        && report_send_exists(pool, report_type, week_start, &to_addrs, &cc_addrs).await?
+    {
         bail!(
             "weekly report for {} was already sent to {}; rerun with --force to resend",
             week_start,
@@ -1029,7 +1040,7 @@ async fn weekly_report(pool: &PgPool, cfg: &AppConfig, args: WeeklyReportArgs) -
     record_report_send(
         pool,
         ReportSendRecord {
-            report_type: "weekly",
+            report_type,
             week_start,
             week_end,
             to_addrs: &to_addrs,
